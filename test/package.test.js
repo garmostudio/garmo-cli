@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
@@ -29,6 +29,6 @@ test('source has no eval, child processes or dynamic imports, and only Node modu
 });
 
 test('version is the same in package.json and the code', async () => {
-  const { VERSION } = await import(path.join(root, 'src', 'commands.js'));
+  const { VERSION } = await import(pathToFileURL(path.join(root, 'src', 'commands.js')).href);
   assert.equal(VERSION, pkg.version);
 });
