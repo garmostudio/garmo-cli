@@ -2,7 +2,7 @@
 // main.js parses with it, `garmo --help` prints it, and the docs page and npm README are made from it.
 // test/spec.test.js checks every API parameter here against api/openapi.json (made from scripts/api/spec.py).
 
-export const VERSION = '0.9.2';
+export const VERSION = '0.9.3';
 
 const SCENES = ['white', 'beige', 'grey', 'sage', 'lobby', 'cafe', 'gallery', 'living', 'paris', 'terrace', 'coast', 'desert', 'lake', 'marble', 'linen', 'wood', 'stone'];
 const POSES = ['standing', 'three', 'side', 'back', 'walking', 'seated', 'pockets', 'leaning'];

@@ -126,7 +126,18 @@ export class Client {
       const remaining = Number(res.headers.get('x-ratelimit-remaining'));
       this.lowRemaining = Number.isFinite(remaining) && remaining <= 2;
       if (res.status >= 300 && res.status < 400) throw new ApiError(res.status, 'unexpected_redirect', `The API answered with a redirect (${res.status}); refusing to follow it.`);
-      const text = await res.text();
+      let text;
+      try { text = await res.text(); } catch (error) {
+        // The headers came but the body was cut off: the server may have made the job. Ask again with the same key.
+        if (signal?.aborted) throw error;
+        if (retryable && attempt < this.maxAttempts) {
+          this.log?.('  answer cut off, retrying');
+          uncertain = true;
+          await sleep(retryAfterMs(null, attempt) * this.waitScale, signal);
+          continue;
+        }
+        throw new ApiError(0, 'network_error', `The answer from ${url.host} was cut off: ${redact(error.cause?.code ?? error.message)}`);
+      }
       let body = null;
       try { body = text ? JSON.parse(text) : null; } catch { body = null; }
       this.log?.(`← ${res.status} ${res.headers.get('x-request-id') ?? ''}`);

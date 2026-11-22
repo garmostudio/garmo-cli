@@ -16,7 +16,6 @@ export class RunState {
   constructor(outDir) {
     this.file = path.join(outDir, STATE_FILE);
     this.data = { version: 1, entries: {} };
-    this.own = new Set();
     try {
       const loaded = JSON.parse(fs.readFileSync(this.file, 'utf8'));
       if (loaded?.version === 1 && loaded.entries && typeof loaded.entries === 'object') this.data = loaded;
@@ -24,14 +23,34 @@ export class RunState {
   }
   get(idem) { return this.data.entries[idem] ?? null; }
   set(idem, patch) {
-    // Another command may share this folder: read the file again and change only our own entry, so neither loses the other's jobs.
-    try {
-      const disk = JSON.parse(fs.readFileSync(this.file, 'utf8'));
-      if (disk?.version === 1 && disk.entries && typeof disk.entries === 'object') this.data.entries = { ...disk.entries, ...Object.fromEntries(Object.entries(this.data.entries).filter(([k]) => !(k in disk.entries) && this.own.has(k))) };
-    } catch { /* first write, or unreadable: keep what we have */ }
-    this.own.add(idem);
-    this.data.entries[idem] = { ...(this.data.entries[idem] ?? {}), ...patch, updated_at: new Date().toISOString() };
-    this.save();
+    // Another command may share this folder. Under a lock: read the file again, change only our own entry, write it
+    // back. Neither command can then lose the other's jobs, whatever the timing.
+    this.locked(() => {
+      let entries = this.data.entries;
+      try {
+        const disk = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+        if (disk?.version === 1 && disk.entries && typeof disk.entries === 'object') entries = disk.entries;
+      } catch { /* first write, or unreadable: keep what we have */ }
+      this.data.entries = entries;
+      this.data.entries[idem] = { ...(entries[idem] ?? {}), ...patch, updated_at: new Date().toISOString() };
+      this.save();
+    });
+  }
+  /** One writer at a time: a lock directory (creating it is atomic); one left behind by a crash is taken over after 10 s. */
+  locked(fn) {
+    fs.mkdirSync(path.dirname(this.file), { recursive: true });
+    const lock = `${this.file}.lock`;
+    const nap = new Int32Array(new SharedArrayBuffer(4));
+    const until = Date.now() + 15_000;
+    for (;;) {
+      try { fs.mkdirSync(lock); break; } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        try { if (Date.now() - fs.statSync(lock).mtimeMs > 10_000) { fs.rmdirSync(lock); continue; } } catch { continue; }
+        if (Date.now() > until) { try { fs.rmdirSync(lock); } catch { /* taken over */ } continue; }
+        Atomics.wait(nap, 0, 0, 10 + Math.floor(Math.random() * 20));
+      }
+    }
+    try { return fn(); } finally { try { fs.rmdirSync(lock); } catch { /* already gone */ } }
   }
   /** Written to a temporary file and renamed, so a crash never leaves a broken state file. */
   save() {

@@ -72,6 +72,12 @@ function fakeApi({ behave = () => null, credits = Infinity } = {}) {
         jobs.set(id, { polls: 0, idem });
         byIdem.set(idem, id);
         if (how === 'lost') { res.destroy(); return; }   // the job exists, but the answer never arrives
+        if (how === 'cutbody') {   // the job exists, the headers arrive, the body breaks off
+          res.writeHead(202, { 'content-type': 'application/json', 'content-length': '500' });
+          res.write('{"id":"job');
+          setTimeout(() => res.destroy(), 5);
+          return;
+        }
         return send(202, payload(id, 'processing'));
       }
       err(404, 'not_found');
@@ -333,4 +339,35 @@ test('two commands on one photo at the same time end with two files, not one ove
   } finally {
     await api.close();
   }
+});
+
+test('a body cut off after the 202 headers is picked up again without a second job', async () => {
+  const api = await fakeApi({ behave: (tag, n) => (tag === 'cutb' && n === 1 ? 'cutbody' : null) });
+  try {
+    const dir = photos(['cutb']);
+    const out = path.join(dir, 'out');
+    const s = await run(api, dir, out);
+    assert.equal(api.created, 1);
+    assert.equal(s.done.length, 1);
+    assert.equal(s.failed.length, 0);
+  } finally {
+    await api.close();
+  }
+});
+
+test('many processes writing one state file lose no entry', async () => {
+  const { spawn } = await import('node:child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'garmo-lock-'));
+  const script = path.resolve('src/batch.js');
+  const code = `import { RunState } from ${JSON.stringify('file://' + script)};
+    const s = new RunState(${JSON.stringify(dir)});
+    for (let i = 0; i < 40; i++) s.set(process.argv[1] + '-' + i, { status: 'creating' });`;
+  const runs = [0, 1, 2, 3, 4, 5].map((n) => new Promise((resolve, reject) => {
+    const c = spawn(process.execPath, ['--input-type=module', '-e', code, String(n)], { stdio: 'inherit' });
+    c.on('exit', (x) => (x === 0 ? resolve() : reject(new Error(`exit ${x}`))));
+  }));
+  await Promise.all(runs);
+  const state = JSON.parse(fs.readFileSync(path.join(dir, STATE_FILE), 'utf8'));
+  assert.equal(Object.keys(state.entries).length, 240);
+  assert.equal(fs.existsSync(path.join(dir, STATE_FILE + '.lock')), false);
 });
