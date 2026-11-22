@@ -49,7 +49,7 @@ function fakeApi({ behave = () => null, credits = Infinity } = {}) {
         const job = jobs.get(id);
         if (!job) return err(404, 'not_found');
         job.polls++;
-        return send(200, payload(id, job.polls > 1 ? 'completed' : 'processing'));
+        return send(200, payload(id, hold ? 'processing' : job.polls > 1 ? 'completed' : 'processing'));
       }
       if (req.method === 'POST' && url.pathname === '/edit/remove-background') {
         const idem = req.headers['idempotency-key'];
@@ -82,8 +82,9 @@ function fakeApi({ behave = () => null, credits = Infinity } = {}) {
     outputs: [{ id: 'out_1', status: status === 'completed' ? 'succeeded' : 'processing', label: 'White', ...(status === 'completed' ? { url: `${base()}/files/${id}-1` } : {}) }],
   });
   const base = () => `http://127.0.0.1:${server.address().port}`;
+  let hold = false;
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({
-    base: base(), server, jobs, attempts, byIdem, get created() { return created; }, set credits(v) { credits = v; },
+    set hold(v) { hold = v; }, base: base(), server, jobs, attempts, byIdem, get created() { return created; }, set credits(v) { credits = v; },
     close: () => new Promise((r) => { server.closeAllConnections(); server.close(r); }),
   })));
 }
@@ -265,6 +266,70 @@ test('--no-wait reports the credits of accepted jobs', async () => {
     const { tasks } = await prepare(tool, {}, items, {}, { test: true });
     const s = await runBatch({ client, tool, tasks, outDir: out, reporter: quiet(), cap: 3, noWait: true });
     assert.equal(s.started.length, 1);
+  } finally {
+    await api.close();
+  }
+});
+
+test('two commands in one folder keep both results and both state entries', async () => {
+  const api = await fakeApi();
+  try {
+    const dir = photos(['one', 'two']);
+    const out = path.join(dir, 'out');
+    const client = new Client({ key: KEY, base: api.base, waitScale: 0.002 });
+    const tool = TOOL['remove-bg'];
+    const mk = async (bg, only) => {
+      const { items } = expandInputs([path.join(dir, only)], { outDir: out });
+      const { tasks } = await prepare(tool, { bg }, items, {}, { test: true });
+      return runBatch({ client, tool, tasks, outDir: out, reporter: quiet(), cap: 3 });
+    };
+    const [a, b] = await Promise.all([mk('white', 'one.png'), mk('white', 'two.png')]);
+    assert.equal(a.done.length + b.done.length, 2);
+    const state = JSON.parse(fs.readFileSync(path.join(out, STATE_FILE), 'utf8'));
+    assert.equal(Object.keys(state.entries).length, 2, 'both jobs are in the state file');
+    assert.equal(fs.readdirSync(out).filter((f) => f.endsWith('.part')).length, 0);
+  } finally {
+    await api.close();
+  }
+});
+
+test('--no-wait lists a job that is still rendering, also when it was started by an earlier run', async () => {
+  const api = await fakeApi();
+  try {
+    const dir = photos(['slow1']);
+    const out = path.join(dir, 'out');
+    const client = new Client({ key: KEY, base: api.base, waitScale: 0.002 });
+    const tool = TOOL['remove-bg'];
+    const { items } = expandInputs([dir], { outDir: out });
+    const { tasks } = await prepare(tool, {}, items, {}, { test: true });
+    api.hold = true;   // the fake keeps the job in "processing"
+    const first = await runBatch({ client, tool, tasks, outDir: out, reporter: quiet(), cap: 3, noWait: true });
+    const second = await runBatch({ client, tool, tasks, outDir: out, reporter: quiet(), cap: 3, noWait: true });
+    assert.equal(first.pending.length, 1);
+    assert.equal(second.pending.length, 1, 'found again on the second run');
+    assert.equal(api.created, 1);
+  } finally {
+    await api.close();
+  }
+});
+
+test('two commands on one photo at the same time end with two files, not one overwritten', async () => {
+  const api = await fakeApi();
+  try {
+    const dir = photos(['same']);
+    const out = path.join(dir, 'out');
+    const client = new Client({ key: KEY, base: api.base, waitScale: 0.002 });
+    const tool = TOOL['remove-bg'];
+    const mk = async (bg) => {
+      const { items } = expandInputs([dir], { outDir: out });
+      const { tasks } = await prepare(tool, { bg }, items, {}, { test: true });
+      return runBatch({ client, tool, tasks, outDir: out, reporter: quiet(), cap: 3 });
+    };
+    await Promise.all([mk('white'), mk('transparent')]);
+    assert.equal(fs.readdirSync(out).filter((f) => f.endsWith('.png')).length, 2);
+    const state = JSON.parse(fs.readFileSync(path.join(out, STATE_FILE), 'utf8'));
+    const files = Object.values(state.entries).flatMap((e) => e.outputs ?? []);
+    assert.equal(new Set(files).size, 2, 'each job owns its own file');
   } finally {
     await api.close();
   }

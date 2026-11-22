@@ -355,7 +355,7 @@ async function cmdTool(tool, argv, reporter, signals) {
 }
 
 function report(s, { reporter, invalid, missing = [], outDir, values }) {
-  const pending = s.started.filter((x) => !s.done.some((d) => d.job_id === x.job_id) && !s.failed.some((f) => f.job_id === x.job_id));
+  const pending = s.pending;
   reporter.event('summary', {
     accepted: s.started.length, done: s.done.length, failed: s.failed.length, skipped: s.skipped.length, invalid: invalid.length, missing: missing.length, not_started: s.notStarted.length,
     still_rendering: pending.map((p) => p.job_id), credits_charged: s.credits, credits_refunded: s.refunded, halted: s.halt ?? null, out: outDir,

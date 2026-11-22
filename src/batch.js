@@ -16,6 +16,7 @@ export class RunState {
   constructor(outDir) {
     this.file = path.join(outDir, STATE_FILE);
     this.data = { version: 1, entries: {} };
+    this.own = new Set();
     try {
       const loaded = JSON.parse(fs.readFileSync(this.file, 'utf8'));
       if (loaded?.version === 1 && loaded.entries && typeof loaded.entries === 'object') this.data = loaded;
@@ -23,6 +24,12 @@ export class RunState {
   }
   get(idem) { return this.data.entries[idem] ?? null; }
   set(idem, patch) {
+    // Another command may share this folder: read the file again and change only our own entry, so neither loses the other's jobs.
+    try {
+      const disk = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+      if (disk?.version === 1 && disk.entries && typeof disk.entries === 'object') this.data.entries = { ...disk.entries, ...Object.fromEntries(Object.entries(this.data.entries).filter(([k]) => !(k in disk.entries) && this.own.has(k))) };
+    } catch { /* first write, or unreadable: keep what we have */ }
+    this.own.add(idem);
     this.data.entries[idem] = { ...(this.data.entries[idem] ?? {}), ...patch, updated_at: new Date().toISOString() };
     this.save();
   }
@@ -207,7 +214,7 @@ export async function prepare(tool, opts, items, extras, { skuFromName, test, sc
 export async function runBatch({ client, tool, tasks, outDir, reporter, cap, noWait = false, overwrite = false, stop = { requested: false }, signal, fetchImpl }) {
   const state = new RunState(outDir);
   const slots = new Slots(cap);
-  const summary = { done: [], failed: [], skipped: [], started: [], notStarted: [], credits: 0, refunded: 0, fatal: null };
+  const summary = { done: [], failed: [], skipped: [], started: [], pending: [], notStarted: [], credits: 0, refunded: 0, fatal: null };
   let halt = null;   // 'credits' | 'auth' | 'quota': stop starting new jobs
   let creating = tasks.length;
 
@@ -268,7 +275,8 @@ export async function runBatch({ client, tool, tasks, outDir, reporter, cap, noW
           state.set(request.idem, { file: item.rel, sha256: item.sha ?? null, status: 'creating' });
           const res = await client.request('POST', tool.path, { form: formFactory(request), idem: request.idem, bucket: 'c', timeoutMs: 300_000, signal, cancelled: () => Boolean(halt || stop.requested) });
           job = res.body;
-          task.isNew = res.status === 202;
+          // 202 = made by this request. 200 after a lost answer = made by an earlier attempt of this same request (paid now).
+          task.isNew = res.status === 202 || (res.status === 200 && res.uncertain && known?.status !== 'creating');
           if (task.isNew) summary.credits += job.credits_charged ?? 0;   // charged when the job is accepted, finished or not
         } finally {
           creating--;
@@ -282,10 +290,10 @@ export async function runBatch({ client, tool, tasks, outDir, reporter, cap, noW
         if (noWait) {
           // Keep the slot until this job finishes or nothing else needs to start.
           job = await waitJob(client, job.id, { signal, done: () => creating <= 0 || halt || stop.requested });
-          if (job.status === 'processing') return;
+          if (job.status === 'processing') { summary.pending.push({ file: item.rel, job_id: job.id }); return; }
         } else {
           job = await waitJob(client, job.id, { signal });
-          if (job.status === 'processing') return;   // aborted
+          if (job.status === 'processing') { summary.pending.push({ file: item.rel, job_id: job.id }); return; }   // aborted
         }
       }
     } catch (error) {

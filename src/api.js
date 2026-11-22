@@ -102,6 +102,7 @@ export class Client {
     for (const [k, v] of Object.entries(query ?? {})) if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
     const retryable = method === 'GET' || Boolean(idem) || path.endsWith('/cancel');
     let served500 = false;
+    let uncertain = false;   // an attempt may have reached the server without an answer coming back
     for (let attempt = 1; ; attempt++) {
       const win = this.windows[bucket ?? (method === 'GET' ? 'r' : 'c')];
       if (win) await win.take();
@@ -116,6 +117,7 @@ export class Client {
         if (signal?.aborted) throw error;
         if (retryable && attempt < this.maxAttempts) {
           this.log?.(`  network error (${redact(error.cause?.code ?? error.message)}), retrying`);
+          uncertain = true;
           await sleep(retryAfterMs(null, attempt) * this.waitScale, signal);
           continue;
         }
@@ -128,7 +130,7 @@ export class Client {
       let body = null;
       try { body = text ? JSON.parse(text) : null; } catch { body = null; }
       this.log?.(`← ${res.status} ${res.headers.get('x-request-id') ?? ''}`);
-      if (res.ok) return { status: res.status, body, headers: res.headers };
+      if (res.ok) return { status: res.status, body, headers: res.headers, uncertain };
 
       const err = body?.error ?? {};
       const code = err.code ?? (body === null ? 'bad_response' : 'error');
@@ -139,6 +141,7 @@ export class Client {
       // A day's file quota will not clear by waiting a minute.
       if (again && !(res.status === 429 && Number(res.headers.get('retry-after')) > 3600)) {
         if (res.status === 500) served500 = true;
+        if (res.status >= 500) uncertain = true;
         const wait = retryAfterMs(res, attempt) * this.waitScale;
         this.log?.(`  ${code}, waiting ${Math.round(wait / 1000)} s`);
         await sleep(wait, signal);
@@ -157,6 +160,24 @@ function downloadAllowed(url, base) {
   if (url.protocol === 'https:') return true;
   const b = new URL(base);
   return b.protocol === 'http:' && url.origin === b.origin;
+}
+
+/**
+ * Moves the finished download into place without ever replacing a file another command put there in the
+ * meantime (a hard link fails when the name is taken): then this job's file gets its short code instead.
+ */
+function place(part, dest, { overwrite, stem, ext, tag }) {
+  if (overwrite) { fs.renameSync(part, dest); return dest; }
+  for (const target of [dest, `${stem}-${tag ?? 'job'}.${ext}`]) {
+    try { fs.linkSync(part, target); fs.unlinkSync(part); return target; }
+    catch (error) {
+      if (error.code === 'EEXIST') continue;
+      // No hard links on this file system: the plain rename is all there is.
+      fs.renameSync(part, target); return target;
+    }
+  }
+  fs.unlinkSync(part);   // both names taken by others: keep theirs
+  return `${stem}-${tag ?? 'job'}.${ext}`;
 }
 
 /**
@@ -190,7 +211,7 @@ export async function download(link, stem, { base = DEFAULT_BASE, fetchImpl = gl
     dest = `${stem}-${tag ?? 'job'}.${ext}`;
     if (exists(dest)) { await res.body?.cancel(); return { path: dest, skipped: true }; }
   }
-  const part = `${dest}.part`;
+  const part = `${dest}.${process.pid}.part`;   // per process: two commands in one folder never share a half file
   let seen = 0;
   const limit = new Transform({
     transform(chunk, _enc, cb) {
@@ -201,7 +222,7 @@ export async function download(link, stem, { base = DEFAULT_BASE, fetchImpl = gl
   try {
     await pipeline(Readable.fromWeb(res.body), limit, fs.createWriteStream(part, { mode: 0o644 }));
     if (Number.isFinite(length) && length > 0 && seen !== length) throw new Error('Download was cut off.');
-    fs.renameSync(part, dest);
+    dest = place(part, dest, { overwrite, stem, ext, tag });
   } catch (error) {
     try { fs.unlinkSync(part); } catch { /* already gone */ }
     throw error;
