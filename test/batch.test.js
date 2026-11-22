@@ -214,3 +214,58 @@ test('a wrong key stops the run at once', async () => {
     await api.close();
   }
 });
+
+test('two jobs never write one file: same safe name, or the same photo with other settings', async () => {
+  const api = await fakeApi();
+  try {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'garmo-coll-'));
+    fs.writeFileSync(path.join(dir, 'a b.png'), Buffer.concat([PNG, Buffer.from('tag:one ')]));
+    fs.writeFileSync(path.join(dir, 'a_b.png'), Buffer.concat([PNG, Buffer.from('tag:two ')]));
+    const out = path.join(dir, 'out');
+    const s = await run(api, dir, out);
+    assert.equal(s.done.length, 2);
+    const pngs = fs.readdirSync(out).filter((f) => f.endsWith('.png'));
+    assert.equal(pngs.length, 2, `two files, got ${pngs}`);
+
+    // Same photo, other settings: the second job's file does not replace or hide the first.
+    const solo = photos(['solo']);
+    const out2 = path.join(solo, 'out');
+    const client = new Client({ key: KEY, base: api.base, waitScale: 0.002 });
+    const tool = TOOL['remove-bg'];
+    for (const bg of ['white', 'transparent']) {
+      const { items } = expandInputs([solo], { outDir: out2 });
+      const { tasks } = await prepare(tool, { bg }, items, {}, { test: true });
+      const r = await runBatch({ client, tool, tasks, outDir: out2, reporter: quiet(), cap: 3 });
+      assert.equal(r.done.length, 1);
+    }
+    assert.equal(fs.readdirSync(out2).filter((f) => f.endsWith('.png')).length, 2);
+  } finally {
+    await api.close();
+  }
+});
+
+test('a test run never stands in for a live one: the scope is part of the key', async () => {
+  const dir = photos(['p']);
+  const { items } = expandInputs([dir], { outDir: path.join(dir, 'out') });
+  const tool = TOOL['remove-bg'];
+  const a = (await prepare(tool, {}, items, {}, { test: true, scope: 'https://api.garmo.studio|acc_1|test' })).tasks[0].request.idem;
+  const b = (await prepare(tool, {}, items, {}, { test: false, scope: 'https://api.garmo.studio|acc_1|live' })).tasks[0].request.idem;
+  const c = (await prepare(tool, {}, items, {}, { test: false, scope: 'https://api.garmo.studio|acc_2|live' })).tasks[0].request.idem;
+  assert.equal(new Set([a, b, c]).size, 3);
+});
+
+test('--no-wait reports the credits of accepted jobs', async () => {
+  const api = await fakeApi();
+  try {
+    const dir = photos(['n1']);
+    const out = path.join(dir, 'out');
+    const client = new Client({ key: KEY, base: api.base, waitScale: 0.002 });
+    const tool = TOOL['remove-bg'];
+    const { items } = expandInputs([dir], { outDir: out });
+    const { tasks } = await prepare(tool, {}, items, {}, { test: true });
+    const s = await runBatch({ client, tool, tasks, outDir: out, reporter: quiet(), cap: 3, noWait: true });
+    assert.equal(s.started.length, 1);
+  } finally {
+    await api.close();
+  }
+});

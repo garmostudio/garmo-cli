@@ -163,7 +163,7 @@ function downloadAllowed(url, base) {
  * Downloads a finished image without the API key: to `<dest>.part` first, renamed when complete.
  * stem is the file name without extension; the extension comes from the image type. Returns the final path.
  */
-export async function download(link, stem, { base = DEFAULT_BASE, fetchImpl = globalThis.fetch, overwrite = false, exists = fs.existsSync, signal } = {}) {
+export async function download(link, stem, { base = DEFAULT_BASE, fetchImpl = globalThis.fetch, overwrite = false, exists = fs.existsSync, signal, isMine, tag } = {}) {
   let url = new URL(link);
   let res;
   for (let hop = 0; ; hop++) {
@@ -182,8 +182,14 @@ export async function download(link, stem, { base = DEFAULT_BASE, fetchImpl = gl
   if (!ext) { await res.body?.cancel(); throw new Error(`Download is not an image (${type || 'no type'}).`); }
   const length = Number(res.headers.get('content-length'));
   if (length > MAX_DOWNLOAD) { await res.body?.cancel(); throw new Error('Download is larger than 50 MB.'); }
-  const dest = `${stem}.${ext}`;
-  if (!overwrite && exists(dest)) { await res.body?.cancel(); return { path: dest, skipped: true }; }
+  let dest = `${stem}.${ext}`;
+  if (!overwrite && exists(dest)) {
+    // Without isMine (garmo jobs get) any existing file is kept. With it, a file that is not this job's output
+    // (another job, or one that was there before) is never taken for it: this job's file gets a short code instead.
+    if (!isMine || isMine(dest)) { await res.body?.cancel(); return { path: dest, skipped: true }; }
+    dest = `${stem}-${tag ?? 'job'}.${ext}`;
+    if (exists(dest)) { await res.body?.cancel(); return { path: dest, skipped: true }; }
+  }
   const part = `${dest}.part`;
   let seen = 0;
   const limit = new Transform({

@@ -313,7 +313,7 @@ async function cmdTool(tool, argv, reporter, signals) {
     client.setLimits(account.limits);
   }
   const test = account ? !account.livemode : false;
-  const { tasks, invalid } = await prepare(tool, values, items, extras, { skuFromName: values['sku-from-name'], test });
+  const { tasks, invalid } = await prepare(tool, values, items, extras, { skuFromName: values['sku-from-name'], test, scope: account ? `${client.base}|${account.account_id ?? ''}|${account.livemode ? 'live' : 'test'}` : '' });
   for (const x of invalid) reporter.warn(`${x.file}: ${x.reason}, skipped`);
 
   const credits = tasks.reduce((s, t) => s + t.credits, 0);
@@ -334,7 +334,7 @@ async function cmdTool(tool, argv, reporter, signals) {
     for (const t of tasks) reporter.info(`  ${t.item.rel}${t.item.kind === 'url' ? ` (${t.item.url})` : ''}`);
     if (!client) reporter.info('(No key, so no balance. Run `garmo login`.)');
     else if (!test && credits > balance) reporter.warn(`Your balance (${balance}) is short of ~${credits}; the run would stop when it runs out. Buy credits at ${STUDIO_API}`);
-    return invalid.length ? EXIT.partial : EXIT.ok;
+    return invalid.length || missing.length ? EXIT.partial : EXIT.ok;
   }
   if (tasks.length === 0) { reporter.error('Nothing to send.'); return EXIT.partial; }
 
@@ -351,19 +351,20 @@ async function cmdTool(tool, argv, reporter, signals) {
   reporter.info(`${plan} · ${cap} at once → ${shown(outDir)}`);
   signals.onFirst = () => reporter.warn('Stopping: no new jobs. Jobs already rendering finish and download (their credits are spent). Ctrl+C again to quit now; run the same command later to pick them up.');
   const summary = await runBatch({ client, tool, tasks, outDir, reporter, cap, noWait: values['no-wait'], overwrite: values.overwrite, stop: signals.stop, signal: signals.abort.signal });
-  return report(summary, { reporter, invalid, outDir, tool, values, test });
+  return report(summary, { reporter, invalid, missing, outDir, tool, values, test });
 }
 
-function report(s, { reporter, invalid, outDir, values }) {
+function report(s, { reporter, invalid, missing = [], outDir, values }) {
   const pending = s.started.filter((x) => !s.done.some((d) => d.job_id === x.job_id) && !s.failed.some((f) => f.job_id === x.job_id));
   reporter.event('summary', {
-    done: s.done.length, failed: s.failed.length, skipped: s.skipped.length, invalid: invalid.length, not_started: s.notStarted.length,
+    accepted: s.started.length, done: s.done.length, failed: s.failed.length, skipped: s.skipped.length, invalid: invalid.length, missing: missing.length, not_started: s.notStarted.length,
     still_rendering: pending.map((p) => p.job_id), credits_charged: s.credits, credits_refunded: s.refunded, halted: s.halt ?? null, out: outDir,
   });
   const parts = [`${s.done.length} done`];
   if (s.skipped.length) parts.push(`${s.skipped.length} already done`);
   if (s.failed.length) parts.push(`${s.failed.length} failed`);
   if (invalid.length) parts.push(`${invalid.length} not photos`);
+  if (missing.length) parts.push(`${missing.length} not found`);
   if (s.notStarted.length) parts.push(`${s.notStarted.length} not started`);
   if (pending.length) parts.push(`${pending.length} still rendering`);
   reporter.info(`\n${parts.join(' · ')} · ${plural(s.credits - s.refunded, 'credit')} spent`);
@@ -372,7 +373,8 @@ function report(s, { reporter, invalid, outDir, values }) {
   if (s.halt === 'auth') { reporter.error(`${s.fatal?.message ?? 'The key was refused.'}`); return EXIT.auth; }
   if (s.halt === 'quota') { reporter.error(s.fatal?.message ?? 'Daily file limit reached.'); return EXIT.partial; }
   if (s.halt === 'interrupted' || s.notStarted.length) { reporter.info('Run the same command again to continue where it stopped.'); return EXIT.partial; }
-  return s.failed.length || invalid.length || pending.length ? EXIT.partial : EXIT.ok;
+  // With --no-wait a job still rendering is the expected state (accepted, paid, collected by the next run).
+  return s.failed.length || invalid.length || missing.length || (pending.length && !values['no-wait']) ? EXIT.partial : EXIT.ok;
 }
 
 /* ------------------------------------------------------------------ main */
@@ -386,7 +388,7 @@ export async function main(argv) {
   const onSigint = () => {
     interrupts++;
     if (interrupts === 1) { signals.stop.requested = true; signals.onFirst?.(); if (!signals.onFirst) process.exit(130); return; }
-    reporter.warn('Quit. Jobs keep rendering on Garmo; run the same command again to download them without paying twice.');
+    reporter.warn('Quit. Jobs keep rendering on Garmo; run the same command again to download them without paying again.');
     process.exit(130);
   };
   process.on('SIGINT', onSigint);

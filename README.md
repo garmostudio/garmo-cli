@@ -15,7 +15,7 @@ Using it often? Install it once with `npm i -g @garmo/cli` and the command is ju
 `garmo remove-bg ./products/`. The examples below use that short form.
 
 - **Safe to stop and repeat.** Ctrl+C, a crash or a closed laptop: run the same command again and it carries on.
-  The same photo with the same settings is never charged twice.
+  Repeating the same command is safe: no photo is charged twice within 24 hours, as long as you use the same output folder (it keeps a `.garmo-run.json`).
 - **Asks before it spends**, shows the credits first, and `--dry-run` sends nothing.
 - **For scripts and AI agents:** `--json` prints one event per line; exit codes say what happened.
 - **No dependencies, no install scripts, no telemetry.** Needs Node.js 20.3 or newer. macOS, Windows, Linux.

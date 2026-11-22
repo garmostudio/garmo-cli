@@ -44,7 +44,7 @@ const normHex = (v) => { const h = String(v).trim().toLowerCase(); return h.star
  * always give the same fields, so the same Idempotency-Key matches the server's fingerprint of the request.
  * opts: parsed tool flags. extras: { flagName: [{ kind: 'url', url } | { kind: 'file', abs, type, sha }] }.
  */
-export function buildRequest(tool, opts, item, extras = {}, { skuFromName = false } = {}) {
+export function buildRequest(tool, opts, item, extras = {}, { skuFromName = false, scope = '' } = {}) {
   const fields = {};
   const files = [];
   for (const [flag, def] of Object.entries(tool.flags)) {
@@ -71,7 +71,7 @@ export function buildRequest(tool, opts, item, extras = {}, { skuFromName = fals
   if (item.kind === 'url') fields.image_url = item.url;
   else files.unshift({ field: 'image', abs: item.abs, type: item.type, sha: item.sha, name: `photo.${item.type.split('/')[1].replace('jpeg', 'jpg')}` });
   const sorted = Object.keys(fields).sort().map((k) => [k, fields[k]]);
-  const idem = 'cli-' + crypto.createHash('sha256').update(JSON.stringify([tool.path, sorted, files.map((f) => [f.field, f.sha])])).digest('hex').slice(0, 40);
+  const idem = 'cli-' + crypto.createHash('sha256').update(JSON.stringify([tool.path, sorted, files.map((f) => [f.field, f.sha]), scope])).digest('hex').slice(0, 40);
   return { fields, files, idem };
 }
 
@@ -125,7 +125,7 @@ function stemsFor(job, outDir, rel, toolName) {
 }
 
 /** Downloads every succeeded output of a finished job. Returns { files, failed: [{ id, code, message }] }. */
-export async function downloadJob(job, { outDir, rel, toolName, base, overwrite, fetchImpl, reporter, signal }) {
+export async function downloadJob(job, { outDir, rel, toolName, base, overwrite, fetchImpl, reporter, signal, isMine, tag }) {
   const stems = stemsFor(job, outDir, rel, toolName);
   const files = [];
   const failed = [];
@@ -138,7 +138,7 @@ export async function downloadJob(job, { outDir, rel, toolName, base, overwrite,
     let lastError;
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        const r = await download(o.url, stems[i], { base, overwrite, fetchImpl, signal });
+        const r = await download(o.url, stems[i], { base, overwrite, fetchImpl, signal, isMine, tag });
         files.push(r.path);
         reporter?.event('output', { job_id: job.id, output_id: o.id, label: o.label, path: r.path, skipped: r.skipped });
         lastError = null;
@@ -171,7 +171,7 @@ export async function waitJob(client, jobId, { signal, done } = {}) {
  * Prepares every input: checks local files (free, no network), hashes them, builds the request.
  * Returns { tasks, invalid } where each task has item, request, images, credits.
  */
-export async function prepare(tool, opts, items, extras, { skuFromName, test }) {
+export async function prepare(tool, opts, items, extras, { skuFromName, test, scope = '' }) {
   const tasks = [];
   const invalid = [];
   for (const item of items) {
@@ -182,22 +182,22 @@ export async function prepare(tool, opts, items, extras, { skuFromName, test }) 
       item.size = c.size;
       item.sha = await sha256File(item.abs);
     }
-    const request = buildRequest(tool, opts, item, extras, { skuFromName });
+    const request = buildRequest(tool, opts, item, extras, { skuFromName, scope });
     tasks.push({ item, request, images: tool.images(opts), credits: test ? 0 : tool.credits(opts) });
-  }
-  // Two inputs with the same name (a.jpg and a.png) would write the same outputs; keep the extension then.
-  const byStem = new Map();
-  for (const t of tasks) {
-    const key = t.item.rel.replace(/\.[^./\\]*$/, '').toLowerCase();
-    byStem.set(key, (byStem.get(key) ?? 0) + 1);
-  }
-  for (const t of tasks) {
-    const key = t.item.rel.replace(/\.[^./\\]*$/, '').toLowerCase();
-    if (byStem.get(key) > 1) t.item.rel = t.item.rel.replace(/\.([^./\\]*)$/, '-$1');
   }
   // The same photo twice with the same settings is one job, so one task.
   const seen = new Set();
-  return { tasks: tasks.filter((t) => (seen.has(t.request.idem) ? false : seen.add(t.request.idem))), invalid };
+  tasks.splice(0, tasks.length, ...tasks.filter((t) => (seen.has(t.request.idem) ? false : seen.add(t.request.idem))));
+  // Two different jobs must never write the same file: a.jpg and a.png, or "a b.png" and "a_b.png" (same safe name).
+  // The first pass keeps the extension, the second adds a short code from the job's own key.
+  const stemKey = (t) => t.item.rel.replace(/\.[^./\\]*$/, '').toLowerCase();
+  const count = (keyOf) => { const m = new Map(); for (const t of tasks) m.set(keyOf(t), (m.get(keyOf(t)) ?? 0) + 1); return m; };
+  const byStem = count(stemKey);
+  for (const t of tasks) if (byStem.get(stemKey(t)) > 1) t.item.rel = t.item.rel.replace(/\.([^./\\]*)$/, '-$1');
+  const safeKey = (t) => outputStem('/out', t.item.rel, tool.name, '').toLowerCase();
+  const bySafe = count(safeKey);
+  for (const t of tasks) if (bySafe.get(safeKey(t)) > 1) t.item.rel = t.item.rel.replace(/(\.[^./\\]*)?$/, `-${t.request.idem.slice(4, 10)}$1`);
+  return { tasks, invalid };
 }
 
 /**
@@ -215,8 +215,10 @@ export async function runBatch({ client, tool, tasks, outDir, reporter, cap, noW
     const { item } = task;
     state.set(task.request.idem, { job_id: job.id, status: job.status });
     // Only jobs this run started count as spending; a job the server handed back (same Idempotency-Key) was paid before.
-    if (task.isNew) { summary.credits += job.credits_charged ?? 0; summary.refunded += job.credits_refunded ?? 0; }
-    const { files, failed } = await downloadJob(job, { outDir, rel: item.rel, toolName: tool.name, base: client.base, overwrite, fetchImpl, reporter, signal });
+    if (task.isNew) summary.refunded += job.credits_refunded ?? 0;
+    // A file already there only counts as this job's if the state file says so; otherwise the new file gets a short code.
+    const mine = (abs) => (state.get(task.request.idem)?.outputs ?? []).some((f) => path.resolve(outDir, f) === path.resolve(abs));
+    const { files, failed } = await downloadJob(job, { outDir, rel: item.rel, toolName: tool.name, base: client.base, overwrite, fetchImpl, reporter, signal, isMine: mine, tag: task.request.idem.slice(4, 10) });
     const rel = files.map((f) => path.relative(outDir, f));
     state.set(task.request.idem, { status: failed.length === 0 ? 'done' : 'partial', outputs: rel });
     reporter.event('job', { file: item.rel, job_id: job.id, status: job.status, outputs: files, failed_outputs: failed, credits_charged: job.credits_charged ?? 0, credits_refunded: job.credits_refunded ?? 0 });
@@ -267,6 +269,7 @@ export async function runBatch({ client, tool, tasks, outDir, reporter, cap, noW
           const res = await client.request('POST', tool.path, { form: formFactory(request), idem: request.idem, bucket: 'c', timeoutMs: 300_000, signal, cancelled: () => Boolean(halt || stop.requested) });
           job = res.body;
           task.isNew = res.status === 202;
+          if (task.isNew) summary.credits += job.credits_charged ?? 0;   // charged when the job is accepted, finished or not
         } finally {
           creating--;
         }
