@@ -1,5 +1,6 @@
 // Talks to https://api.garmo.studio/v1 and nothing else (plus signed file links without the key).
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { Readable, Transform } from 'node:stream';
 import { VERSION } from './commands.js';
@@ -174,25 +175,35 @@ function downloadAllowed(url, base) {
 }
 
 /**
- * Moves the finished download into place without ever replacing a file another command put there in the
- * meantime (a hard link fails when the name is taken): then this job's file gets its short code instead.
+ * Places a completed download without replacing a file another command put there in the meantime.
  */
-function place(part, dest, { overwrite, stem, ext, tag }) {
-  if (overwrite) { fs.renameSync(part, dest); return dest; }
-  for (const target of [dest, `${stem}-${tag ?? 'job'}.${ext}`]) {
-    try { fs.linkSync(part, target); fs.unlinkSync(part); return target; }
-    catch (error) {
-      if (error.code === 'EEXIST') continue;
-      // No hard links on this file system: the plain rename is all there is.
-      fs.renameSync(part, target); return target;
-    }
+function place(part, stem, ext, { overwrite, isMine, tag }) {
+  const dest = `${stem}.${ext}`;
+  if (overwrite) {
+    fs.renameSync(part, dest);
+    return { path: dest, skipped: false };
   }
-  fs.unlinkSync(part);   // both names taken by others: keep theirs
-  return `${stem}-${tag ?? 'job'}.${ext}`;
+  const alternate = `${stem}-${tag ?? 'job'}`;
+  for (let attempt = 0; ; attempt++) {
+    const target = attempt === 0 ? dest : `${alternate}${attempt === 1 ? '' : `-${attempt}`}.${ext}`;
+    try {
+      try { fs.linkSync(part, target); } catch (error) {
+        if (!['EPERM', 'ENOSYS', 'ENOTSUP', 'EOPNOTSUPP', 'EXDEV'].includes(error.code)) throw error;
+        fs.copyFileSync(part, target, fs.constants.COPYFILE_EXCL);
+      }
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      if (isMine && !isMine(target)) continue;
+      fs.unlinkSync(part);
+      return { path: target, skipped: true };
+    }
+    fs.unlinkSync(part);
+    return { path: target, skipped: false };
+  }
 }
 
 /**
- * Downloads a finished image without the API key: to `<dest>.part` first, renamed when complete.
+ * Downloads a finished image without the API key, to a unique temporary file first.
  * stem is the file name without extension; the extension comes from the image type. Returns the final path.
  */
 export async function download(link, stem, { base = DEFAULT_BASE, fetchImpl = globalThis.fetch, overwrite = false, exists = fs.existsSync, signal, isMine, tag } = {}) {
@@ -214,15 +225,12 @@ export async function download(link, stem, { base = DEFAULT_BASE, fetchImpl = gl
   if (!ext) { await res.body?.cancel(); throw new Error(`Download is not an image (${type || 'no type'}).`); }
   const length = Number(res.headers.get('content-length'));
   if (length > MAX_DOWNLOAD) { await res.body?.cancel(); throw new Error('Download is larger than 50 MB.'); }
-  let dest = `${stem}.${ext}`;
-  if (!overwrite && exists(dest)) {
-    // Without isMine (garmo jobs get) any existing file is kept. With it, a file that is not this job's output
-    // (another job, or one that was there before) is never taken for it: this job's file gets a short code instead.
-    if (!isMine || isMine(dest)) { await res.body?.cancel(); return { path: dest, skipped: true }; }
-    dest = `${stem}-${tag ?? 'job'}.${ext}`;
-    if (exists(dest)) { await res.body?.cancel(); return { path: dest, skipped: true }; }
+  const dest = `${stem}.${ext}`;
+  if (!overwrite && exists(dest) && (!isMine || isMine(dest))) {
+    await res.body?.cancel();
+    return { path: dest, skipped: true };
   }
-  const part = `${dest}.${process.pid}.part`;   // per process: two commands in one folder never share a half file
+  const part = `${dest}.${randomUUID()}.part`;
   let seen = 0;
   const limit = new Transform({
     transform(chunk, _enc, cb) {
@@ -231,12 +239,11 @@ export async function download(link, stem, { base = DEFAULT_BASE, fetchImpl = gl
     },
   });
   try {
-    await pipeline(Readable.fromWeb(res.body), limit, fs.createWriteStream(part, { mode: 0o644 }));
+    await pipeline(Readable.fromWeb(res.body), limit, fs.createWriteStream(part, { flags: 'wx', mode: 0o644 }));
     if (Number.isFinite(length) && length > 0 && seen !== length) throw new Error('Download was cut off.');
-    dest = place(part, dest, { overwrite, stem, ext, tag });
+    return place(part, stem, ext, { overwrite, isMine, tag });
   } catch (error) {
     try { fs.unlinkSync(part); } catch { /* already gone */ }
     throw error;
   }
-  return { path: dest, skipped: false };
 }

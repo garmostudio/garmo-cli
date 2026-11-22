@@ -5,8 +5,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { Writable } from 'node:stream';
-import { Client } from '../src/api.js';
+import { setTimeout as delay } from 'node:timers/promises';
+import { Client, download } from '../src/api.js';
 import { prepare, runBatch, STATE_FILE } from '../src/batch.js';
 import { expandInputs } from '../src/files.js';
 import { Reporter } from '../src/output.js';
@@ -14,9 +17,10 @@ import { TOOL } from '../src/commands.js';
 
 const PNG = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
 const KEY = 'gm_test_' + 'k'.repeat(43);
+const STATE_MODULE = new URL('../src/batch.js', import.meta.url).href;
 
 /** A fake API. behave(name, attempt) may return 'rate' | 'busy' | 'boom' | 'lost' | 'slow' | 'bad' | 'broke' | null. */
-function fakeApi({ behave = () => null, credits = Infinity } = {}) {
+function fakeApi({ behave = () => null, credits = Infinity, creditsCharged = 0 } = {}) {
   const jobs = new Map();         // id → { polls, idem }
   const byIdem = new Map();       // idem → id
   const attempts = new Map();     // idem → n
@@ -84,7 +88,7 @@ function fakeApi({ behave = () => null, credits = Infinity } = {}) {
     });
   });
   const payload = (id, status) => ({
-    id, object: 'job', tool: 'remove-background', status, livemode: false, credits_charged: 0, credits_refunded: 0,
+    id, object: 'job', tool: 'remove-background', status, livemode: false, credits_charged: creditsCharged, credits_refunded: 0,
     outputs: [{ id: 'out_1', status: status === 'completed' ? 'succeeded' : 'processing', label: 'White', ...(status === 'completed' ? { url: `${base()}/files/${id}-1` } : {}) }],
   });
   const base = () => `http://127.0.0.1:${server.address().port}`;
@@ -342,7 +346,7 @@ test('two commands on one photo at the same time end with two files, not one ove
 });
 
 test('a body cut off after the 202 headers is picked up again without a second job', async () => {
-  const api = await fakeApi({ behave: (tag, n) => (tag === 'cutb' && n === 1 ? 'cutbody' : null) });
+  const api = await fakeApi({ creditsCharged: 1, behave: (tag, n) => (tag === 'cutb' && n === 1 ? 'cutbody' : null) });
   try {
     const dir = photos(['cutb']);
     const out = path.join(dir, 'out');
@@ -350,16 +354,16 @@ test('a body cut off after the 202 headers is picked up again without a second j
     assert.equal(api.created, 1);
     assert.equal(s.done.length, 1);
     assert.equal(s.failed.length, 0);
+    assert.equal(s.credits, 1);
   } finally {
     await api.close();
   }
 });
 
-test('many processes writing one state file lose no entry', async () => {
-  const { spawn } = await import('node:child_process');
+test('many processes writing one state file lose no entry', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'garmo-lock-'));
-  const script = path.resolve('src/batch.js');
-  const code = `import { RunState } from ${JSON.stringify('file://' + script)};
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const code = `import { RunState } from ${JSON.stringify(STATE_MODULE)};
     const s = new RunState(${JSON.stringify(dir)});
     for (let i = 0; i < 40; i++) s.set(process.argv[1] + '-' + i, { status: 'creating' });`;
   const runs = [0, 1, 2, 3, 4, 5].map((n) => new Promise((resolve, reject) => {
@@ -370,4 +374,61 @@ test('many processes writing one state file lose no entry', async () => {
   const state = JSON.parse(fs.readFileSync(path.join(dir, STATE_FILE), 'utf8'));
   assert.equal(Object.keys(state.entries).length, 240);
   assert.equal(fs.existsSync(path.join(dir, STATE_FILE + '.lock')), false);
+});
+
+test('an old lock stays with its owner until that process exits', { timeout: 10_000 }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'garmo-lock-owner-'));
+  const start = (source) => {
+    const code = `import { RunState } from ${JSON.stringify(STATE_MODULE)};
+      const state = new RunState(process.argv[1]);
+      ${source}`;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', code, dir], { stdio: ['ignore', 'pipe', 'inherit'] });
+    return { child, exit: once(child, 'exit'), ready: once(child.stdout, 'data') };
+  };
+  const owner = start(`state.locked(() => {
+    console.log('locked');
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30_000);
+  });`);
+  let contender;
+  t.after(async () => {
+    owner.child.kill('SIGKILL');
+    contender?.child.kill('SIGKILL');
+    await Promise.all([owner.exit, contender?.exit]);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  await owner.ready;
+  const lock = path.join(dir, `${STATE_FILE}.lock`);
+  const old = new Date(Date.now() - 60_000);
+  fs.utimesSync(lock, old, old);
+  contender = start(`console.log('waiting'); state.set('other-job', { job_id: 'job_2' });`);
+  await contender.ready;
+  await delay(150);
+  assert.equal(fs.existsSync(path.join(dir, STATE_FILE)), false, 'a live owner keeps an old lock');
+  owner.child.kill('SIGKILL');
+  await owner.exit;
+  assert.deepEqual(await contender.exit, [0, null], 'the next writer reclaims the dead owner’s lock');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, STATE_FILE), 'utf8')).entries['other-job'].job_id, 'job_2');
+  assert.equal(fs.existsSync(lock), false);
+});
+
+test('download preserves a late collision even when the file system cannot hard-link', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'garmo-download-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const stem = path.join(dir, 'image');
+  fs.writeFileSync(`${stem}-tag.png`, 'existing alternate');
+  t.mock.method(fs, 'linkSync', (_part, target) => {
+    if (target === `${stem}.png`) fs.writeFileSync(target, 'other download', { flag: 'wx' });
+    const error = new Error('Hard links unavailable');
+    error.code = 'ENOTSUP';
+    throw error;
+  });
+  const result = await download('https://example.com/image', stem, {
+    fetchImpl: async () => new Response(PNG, { headers: { 'Content-Type': 'image/png' } }),
+    tag: 'tag',
+    isMine: () => false,
+  });
+  assert.deepEqual(result, { path: `${stem}-tag-2.png`, skipped: false });
+  assert.equal(fs.readFileSync(`${stem}.png`, 'utf8'), 'other download');
+  assert.equal(fs.readFileSync(`${stem}-tag.png`, 'utf8'), 'existing alternate');
+  assert.deepEqual(fs.readFileSync(result.path), PNG);
 });

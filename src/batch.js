@@ -1,6 +1,7 @@
 // Many photos through one tool: never a second job (and charge) for the same photo and settings,
 // resumable after Ctrl+C or a crash, and within the key's limits.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { ApiError, download } from './api.js';
@@ -8,6 +9,7 @@ import { checkImage, sha256File, outputStem, slug } from './files.js';
 
 export const STATE_FILE = '.garmo-run.json';
 const POLL_MS = 4000;
+const LOCK_HOST = crypto.createHash('sha256').update(os.hostname()).digest('hex').slice(0, 16);
 
 /* ------------------------------------------------------------------ state file */
 
@@ -36,21 +38,27 @@ export class RunState {
       this.save();
     });
   }
-  /** One writer at a time: a lock directory (creating it is atomic); one left behind by a crash is taken over after 10 s. */
+  /** One writer at a time. Only a contender that removes the dead owner's unique marker can remove the lock. */
   locked(fn) {
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
     const lock = `${this.file}.lock`;
+    const owner = path.join(lock, `${LOCK_HOST}-${process.pid}-${crypto.randomUUID()}`);
     const nap = new Int32Array(new SharedArrayBuffer(4));
-    const until = Date.now() + 15_000;
+    const until = performance.now() + 15_000;
     for (;;) {
       try { fs.mkdirSync(lock); break; } catch (error) {
         if (error.code !== 'EEXIST') throw error;
-        try { if (Date.now() - fs.statSync(lock).mtimeMs > 10_000) { fs.rmdirSync(lock); continue; } } catch { continue; }
-        if (Date.now() > until) { try { fs.rmdirSync(lock); } catch { /* taken over */ } continue; }
-        Atomics.wait(nap, 0, 0, 10 + Math.floor(Math.random() * 20));
       }
+      if (clearDeadLock(lock)) continue;
+      if (performance.now() >= until) throw new Error(`Timed out waiting to write ${this.file}. If no Garmo command is using this folder, remove ${lock} and try again.`);
+      Atomics.wait(nap, 0, 0, 10 + Math.floor(Math.random() * 20));
     }
-    try { return fn(); } finally { try { fs.rmdirSync(lock); } catch { /* already gone */ } }
+    try {
+      fs.mkdirSync(owner);
+      try { return fn(); } finally { fs.rmdirSync(owner); }
+    } finally {
+      fs.rmdirSync(lock);
+    }
   }
   /** Written to a temporary file and renamed, so a crash never leaves a broken state file. */
   save() {
@@ -59,6 +67,27 @@ export class RunState {
     fs.writeFileSync(tmp, JSON.stringify(this.data, null, 1) + '\n');
     fs.renameSync(tmp, this.file);
   }
+}
+
+function clearDeadLock(lock) {
+  let entries;
+  try { entries = fs.readdirSync(lock); } catch (error) {
+    if (error.code === 'ENOENT') return true;
+    throw error;
+  }
+  // An empty directory can belong to a writer that is about to publish its marker, including older CLI versions.
+  if (entries.length !== 1) return false;
+  const match = /^([a-f0-9]{16})-([1-9]\d*)-[a-f0-9-]{36}$/.exec(entries[0]);
+  if (match?.[1] !== LOCK_HOST) return false;
+  try { process.kill(Number(match[2]), 0); return false; } catch (error) {
+    if (error.code !== 'ESRCH') return false;
+  }
+  try { fs.rmdirSync(path.join(lock, entries[0])); } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
+  fs.rmdirSync(lock);
+  return true;
 }
 
 /* ------------------------------------------------------------------ requests */
