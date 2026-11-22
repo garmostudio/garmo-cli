@@ -1,5 +1,6 @@
 # Publish to npm when a version tag (v0.9.1, v1.0.0-beta.1 …) is pushed, with provenance and no stored token:
 # npm "trusted publishing" (npmjs.com › @garmo/cli › Settings › Trusted publisher: this repo, release.yml).
+# The version is only STAGED here (the trusted publisher allows `npm stage publish` only); approve it on npmjs.com › @garmo/cli › Staged Packages with your passkey.
 # Pre-release versions (with a "-") go out under the "beta" tag; "latest" is moved by hand after testing.
 name: release
 on:
@@ -21,4 +22,4 @@ jobs:
       - run: node --test
       - name: tag matches package.json
         run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
-      - run: npm publish --provenance --access public --tag ${{ contains(github.ref_name, '-') && 'beta' || 'latest' }}
+      - run: npm stage publish --provenance --access public --tag ${{ contains(github.ref_name, '-') && 'beta' || 'latest' }}
