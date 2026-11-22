@@ -369,6 +369,8 @@ function report(s, { reporter, invalid, missing = [], outDir, values }) {
   if (pending.length) parts.push(`${pending.length} still rendering`);
   reporter.info(`\n${parts.join(' · ')} · ${plural(s.credits - s.refunded, 'credit')} spent`);
   if (pending.length) reporter.info(`Rendering: ${pending.map((p) => p.job_id).join(' ')}\nRun the same command again to download them${values['no-wait'] ? ' (it starts nothing new for these photos)' : ''}.`);
+  const again = s.failed.filter((f) => f.retry).length;
+  if (again) reporter.info(`${plural(again, 'photo')} failed on Garmo's side (credits refunded). Run the same command again to try ${again === 1 ? 'it' : 'them'} with a new job.`);
   if (s.halt === 'credits') { reporter.error(`Out of API credits; ${plural(s.notStarted.length, 'photo')} not started. Buy credits at ${STUDIO_API}, then run the same command again.`); return EXIT.credits; }
   if (s.halt === 'auth') { reporter.error(`${s.fatal?.message ?? 'The key was refused.'}`); return EXIT.auth; }
   if (s.halt === 'quota') { reporter.error(s.fatal?.message ?? 'Daily file limit reached.'); return EXIT.partial; }

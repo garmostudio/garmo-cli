@@ -217,4 +217,4 @@ your shell history, and it is only ever sent to `https://api.garmo.studio`.
 | 3 | No key, a wrong or revoked key, or no API pack |
 | 4 | Out of API credits; buy more and run the same command again |
 
-Version 0.9.4. MIT license.
+Version 0.9.5. MIT license.

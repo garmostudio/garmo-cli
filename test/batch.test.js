@@ -10,7 +10,7 @@ import { once } from 'node:events';
 import { Writable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Client, download } from '../src/api.js';
-import { prepare, runBatch, STATE_FILE } from '../src/batch.js';
+import { prepare, RunState, runBatch, STATE_FILE } from '../src/batch.js';
 import { expandInputs } from '../src/files.js';
 import { Reporter } from '../src/output.js';
 import { TOOL } from '../src/commands.js';
@@ -53,7 +53,7 @@ function fakeApi({ behave = () => null, credits = Infinity, creditsCharged = 0 }
         const job = jobs.get(id);
         if (!job) return err(404, 'not_found');
         job.polls++;
-        return send(200, payload(id, hold ? 'processing' : job.polls > 1 ? 'completed' : 'processing'));
+        return send(200, payload(id, hold ? 'processing' : job.polls > 1 ? (job.fail ? 'failed' : 'completed') : 'processing'));
       }
       if (req.method === 'POST' && url.pathname === '/edit/remove-background') {
         const idem = req.headers['idempotency-key'];
@@ -73,7 +73,7 @@ function fakeApi({ behave = () => null, credits = Infinity, creditsCharged = 0 }
         if (how === 'bad') return err(400, 'invalid_image');
         if (created >= credits) return err(402, 'insufficient_credits');
         const id = `job${tag || 'x'}${++created}`;
-        jobs.set(id, { polls: 0, idem });
+        jobs.set(id, { polls: 0, idem, fail: how === 'failjob' });
         byIdem.set(idem, id);
         if (how === 'lost') { res.destroy(); return; }   // the job exists, but the answer never arrives
         if (how === 'cutbody') {   // the job exists, the headers arrive, the body breaks off
@@ -89,7 +89,7 @@ function fakeApi({ behave = () => null, credits = Infinity, creditsCharged = 0 }
   });
   const payload = (id, status) => ({
     id, object: 'job', tool: 'remove-background', status, livemode: false, credits_charged: creditsCharged, credits_refunded: 0,
-    outputs: [{ id: 'out_1', status: status === 'completed' ? 'succeeded' : 'processing', label: 'White', ...(status === 'completed' ? { url: `${base()}/files/${id}-1` } : {}) }],
+    outputs: [{ id: 'out_1', status: status === 'completed' ? 'succeeded' : status === 'failed' ? 'failed' : 'processing', label: 'White', ...(status === 'completed' ? { url: `${base()}/files/${id}-1` } : {}), ...(status === 'failed' ? { error: { code: 'render_failed', message: 'render failed' } } : {}) }],
   });
   const base = () => `http://127.0.0.1:${server.address().port}`;
   let hold = false;
@@ -146,6 +146,59 @@ test('rate limits, 503, 500, lost answers and in-progress retries never make a s
     const lost = await run(api, dir, out);
     assert.equal(api.created, 8, 'no new jobs without the state file');
     assert.equal(lost.done.length, 8);
+  } finally {
+    await api.close();
+  }
+});
+
+test('a job that failed on the server is tried again by the next run, once, with its own key', async () => {
+  let failing = true;
+  const api = await fakeApi({ behave: (tag) => (tag === 'flaky' && failing ? 'failjob' : null) });
+  try {
+    const dir = photos(['good', 'flaky']);
+    const out = path.join(dir, 'out');
+    const s = await run(api, dir, out);
+    assert.equal(api.created, 2);
+    assert.deepEqual(s.failed.map((f) => [f.file, f.retry]), [['flaky.png', true]]);
+
+    // The same command again: the failed photo gets one new job (a new key), the good one is skipped.
+    failing = false;
+    const s2 = await run(api, dir, out);
+    assert.equal(api.created, 3, 'exactly one new job');
+    assert.equal(s2.skipped.length, 1);
+    assert.deepEqual(s2.done.map((d) => d.file), ['flaky.png']);
+    assert.ok(fs.existsSync(path.join(out, 'flaky-remove-bg-white.png')));
+    const keys = [...api.byIdem.keys()];
+    assert.equal(new Set(keys).size, 3);
+    assert.ok(keys.some((k) => k.endsWith('-r1')));
+
+    // Done now: a third run sends nothing.
+    const s3 = await run(api, dir, out);
+    assert.equal(api.created, 3);
+    assert.equal(s3.skipped.length, 2);
+  } finally {
+    await api.close();
+  }
+});
+
+test('a retry whose answer was lost is asked again with the same retry key, not a third job', async () => {
+  let phase = 'fail';
+  const api = await fakeApi({ behave: (tag, n) => (tag !== 'f1' ? null : phase === 'fail' ? 'failjob' : n === 1 ? 'lost' : null) });
+  try {
+    const dir = photos(['f1']);
+    const out = path.join(dir, 'out');
+    await run(api, dir, out);
+    phase = 'lost';
+    const client = new Client({ key: KEY, base: api.base, waitScale: 0.002, maxAttempts: 1 });
+    const tool = TOOL['remove-bg'];
+    const { items } = expandInputs([dir], { outDir: out });
+    const { tasks } = await prepare(tool, { bg: 'white' }, items, {}, { test: true });
+    const s2 = await runBatch({ client, tool, tasks, outDir: out, reporter: quiet(), cap: 3 });
+    assert.equal(s2.failed.length, 1, 'the answer never came');
+    assert.equal(api.created, 2);
+    const s3 = await run(api, dir, out);
+    assert.equal(api.created, 2, 'the lost retry job is found by its key');
+    assert.equal(s3.done.length, 1);
   } finally {
     await api.close();
   }
@@ -366,11 +419,12 @@ test('many processes writing one state file lose no entry', async (t) => {
   const code = `import { RunState } from ${JSON.stringify(STATE_MODULE)};
     const s = new RunState(${JSON.stringify(dir)});
     for (let i = 0; i < 40; i++) s.set(process.argv[1] + '-' + i, { status: 'creating' });`;
-  const runs = [0, 1, 2, 3, 4, 5].map((n) => new Promise((resolve, reject) => {
-    const c = spawn(process.execPath, ['--input-type=module', '-e', code, String(n)], { stdio: 'inherit' });
-    c.on('exit', (x) => (x === 0 ? resolve() : reject(new Error(`exit ${x}`))));
-  }));
-  await Promise.all(runs);
+  const runs = [0, 1, 2, 3, 4, 5].map((n) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', code, String(n)], { stdio: 'inherit' });
+    return once(child, 'exit');
+  });
+  const exits = await Promise.all(runs);
+  assert.deepEqual(exits.map(([code]) => code), Array(runs.length).fill(0));
   const state = JSON.parse(fs.readFileSync(path.join(dir, STATE_FILE), 'utf8'));
   assert.equal(Object.keys(state.entries).length, 240);
   assert.equal(fs.existsSync(path.join(dir, STATE_FILE + '.lock')), false);
@@ -408,6 +462,39 @@ test('an old lock stays with its owner until that process exits', { timeout: 10_
   await owner.exit;
   assert.deepEqual(await contender.exit, [0, null], 'the next writer reclaims the dead owner’s lock');
   assert.equal(JSON.parse(fs.readFileSync(path.join(dir, STATE_FILE), 'utf8')).entries['other-job'].job_id, 'job_2');
+  assert.equal(fs.existsSync(lock), false);
+});
+
+test('a Windows lock scan and state replacement can retry transient access errors', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'garmo-lock-windows-'));
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  t.after(() => {
+    Object.defineProperty(process, 'platform', platform);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+  const file = path.join(dir, STATE_FILE);
+  const lock = `${file}.lock`;
+  const { mkdirSync, readdirSync, renameSync } = fs;
+  const accessDenied = () => Object.assign(new Error('File handle is busy'), { code: 'EPERM' });
+  let scans = 0;
+  let renames = 0;
+  t.mock.method(fs, 'mkdirSync', (target, ...args) => {
+    if (target === lock && scans === 0) throw Object.assign(new Error('Lock exists'), { code: 'EEXIST' });
+    return mkdirSync(target, ...args);
+  });
+  t.mock.method(fs, 'readdirSync', (target, ...args) => {
+    if (target === lock && scans++ === 0) throw accessDenied();
+    return readdirSync(target, ...args);
+  });
+  t.mock.method(fs, 'renameSync', (source, target) => {
+    if (target === file && renames++ === 0) throw accessDenied();
+    return renameSync(source, target);
+  });
+  fs.writeFileSync(file, JSON.stringify({ version: 1, entries: { previous: { job_id: 'job_1' } } }));
+  new RunState(dir).set('next', { job_id: 'job_2' });
+  assert.deepEqual(Object.values(JSON.parse(fs.readFileSync(file, 'utf8')).entries).map(entry => entry.job_id), ['job_1', 'job_2']);
+  assert.equal(renames, 2);
   assert.equal(fs.existsSync(lock), false);
 });
 

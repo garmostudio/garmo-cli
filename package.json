@@ -1,6 +1,6 @@
 {
   "name": "@garmo/cli",
-  "version": "0.9.4",
+  "version": "0.9.5",
   "description": "Bulk AI photo edits from the terminal: remove backgrounds, upscale, recolor, change scenes, poses and models for whole folders of product photos.",
   "keywords": [
     "bulk-background-remover",

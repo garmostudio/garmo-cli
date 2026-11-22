@@ -10,6 +10,7 @@ import { checkImage, sha256File, outputStem, slug } from './files.js';
 export const STATE_FILE = '.garmo-run.json';
 const POLL_MS = 4000;
 const LOCK_HOST = crypto.createHash('sha256').update(os.hostname()).digest('hex').slice(0, 16);
+const FILE_WAIT = new Int32Array(new SharedArrayBuffer(4));
 
 /* ------------------------------------------------------------------ state file */
 
@@ -43,21 +44,20 @@ export class RunState {
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
     const lock = `${this.file}.lock`;
     const owner = path.join(lock, `${LOCK_HOST}-${process.pid}-${crypto.randomUUID()}`);
-    const nap = new Int32Array(new SharedArrayBuffer(4));
     const until = performance.now() + 15_000;
     for (;;) {
       try { fs.mkdirSync(lock); break; } catch (error) {
-        if (error.code !== 'EEXIST') throw error;
+        if (error.code !== 'EEXIST' && !windowsFileBusy(error)) throw error;
       }
-      if (clearDeadLock(lock)) continue;
       if (performance.now() >= until) throw new Error(`Timed out waiting to write ${this.file}. If no Garmo command is using this folder, remove ${lock} and try again.`);
-      Atomics.wait(nap, 0, 0, 10 + Math.floor(Math.random() * 20));
+      if (clearDeadLock(lock)) continue;
+      waitForFile();
     }
     try {
-      fs.mkdirSync(owner);
-      try { return fn(); } finally { fs.rmdirSync(owner); }
+      retryWindowsFile(() => fs.mkdirSync(owner));
+      try { return fn(); } finally { retryWindowsFile(() => fs.rmdirSync(owner)); }
     } finally {
-      fs.rmdirSync(lock);
+      retryWindowsFile(() => fs.rmdirSync(lock));
     }
   }
   /** Written to a temporary file and renamed, so a crash never leaves a broken state file. */
@@ -65,7 +65,21 @@ export class RunState {
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
     const tmp = `${this.file}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(this.data, null, 1) + '\n');
-    fs.renameSync(tmp, this.file);
+    retryWindowsFile(() => fs.renameSync(tmp, this.file));
+  }
+}
+
+const windowsFileBusy = (error) => process.platform === 'win32' && ['EPERM', 'EACCES', 'EBUSY'].includes(error.code);
+const waitForFile = () => Atomics.wait(FILE_WAIT, 0, 0, 10 + Math.floor(Math.random() * 20));
+
+/** Windows can briefly deny access while another process closes a handle to the file or directory. */
+function retryWindowsFile(operation) {
+  const until = performance.now() + 2_000;
+  for (;;) {
+    try { return operation(); } catch (error) {
+      if (!windowsFileBusy(error) || performance.now() >= until) throw error;
+      waitForFile();
+    }
   }
 }
 
@@ -73,6 +87,7 @@ function clearDeadLock(lock) {
   let entries;
   try { entries = fs.readdirSync(lock); } catch (error) {
     if (error.code === 'ENOENT') return true;
+    if (windowsFileBusy(error)) return false;
     throw error;
   }
   // An empty directory can belong to a writer that is about to publish its marker, including older CLI versions.
@@ -83,10 +98,10 @@ function clearDeadLock(lock) {
     if (error.code !== 'ESRCH') return false;
   }
   try { fs.rmdirSync(path.join(lock, entries[0])); } catch (error) {
-    if (error.code === 'ENOENT') return false;
+    if (error.code === 'ENOENT' || windowsFileBusy(error)) return false;
     throw error;
   }
-  fs.rmdirSync(lock);
+  retryWindowsFile(() => fs.rmdirSync(lock));
   return true;
 }
 
@@ -281,7 +296,7 @@ export async function runBatch({ client, tool, tasks, outDir, reporter, cap, noW
       summary.done.push({ file: item.rel, job_id: job.id, outputs: files });
       reporter.info(`${reporter.c.green('✓')} ${item.rel} → ${rel.join(', ') || '(nothing)'}`);
     } else {
-      summary.failed.push({ file: item.rel, job_id: job.id, outputs: files, errors: failed });
+      summary.failed.push({ file: item.rel, job_id: job.id, outputs: files, errors: failed, retry: job.status === 'failed' });
       reporter.info(`${reporter.c.red('✗')} ${item.rel}: ${failed.map((f) => `${f.id} ${f.code}`).join(', ')}${files.length ? ` (saved ${rel.join(', ')})` : ''}`);
     }
   };
@@ -307,12 +322,25 @@ export async function runBatch({ client, tool, tasks, outDir, reporter, cap, noW
 
     await slots.acquire(task.images);
     let job = null;
+    // Each new job after a failed one gets its own key (…-r1, -r2), saved before it is sent, so a lost answer
+    // is asked again with that same key and still makes one job.
+    let attempt = known?.attempt ?? 0;
+    const idemOf = (a) => (a ? `${request.idem}-r${a}` : request.idem);
     try {
-      if (known?.job_id) {
-        // Started before (this run was interrupted): look at that job, never start another.
-        creating--;
+      let fresh = !known?.job_id;
+      if (!fresh) {
+        // Started before (this run was interrupted): look at that job, never start another while it can still deliver.
         job = await client.get(`/jobs/${encodeURIComponent(known.job_id)}`, undefined, { signal });
-      } else {
+        if (job.status === 'failed') {
+          // Every image of it failed and was refunded: running the command again is how people retry, so start a new job.
+          reporter.info(reporter.c.dim(`↻ ${item.rel}: ${job.id} failed (refunded), trying again`));
+          reporter.event('retry', { file: item.rel, previous_job_id: job.id });
+          attempt++;
+          job = null;
+          fresh = true;
+        } else creating--;
+      }
+      if (fresh) {
         if (halt || stop.requested) {
           creating--;
           summary.notStarted.push({ file: item.rel, reason: halt ?? 'interrupted' });
@@ -320,8 +348,8 @@ export async function runBatch({ client, tool, tasks, outDir, reporter, cap, noW
         }
         try {
           for (const f of request.files) f.blob ??= await fs.openAsBlob(f.abs, { type: f.type });
-          state.set(request.idem, { file: item.rel, sha256: item.sha ?? null, status: 'creating' });
-          const res = await client.request('POST', tool.path, { form: formFactory(request), idem: request.idem, bucket: 'c', timeoutMs: 300_000, signal, cancelled: () => Boolean(halt || stop.requested) });
+          state.set(request.idem, { file: item.rel, sha256: item.sha ?? null, status: 'creating', attempt, job_id: null, outputs: [] });
+          const res = await client.request('POST', tool.path, { form: formFactory(request), idem: idemOf(attempt), bucket: 'c', timeoutMs: 300_000, signal, cancelled: () => Boolean(halt || stop.requested) });
           job = res.body;
           // 202 = made by this request. 200 after a lost answer = made by an earlier attempt of this same request (paid now).
           task.isNew = res.status === 202 || (res.status === 200 && res.uncertain && known?.status !== 'creating');
