@@ -1,0 +1,48 @@
+{
+  "name": "@garmo/cli",
+  "version": "0.9.0",
+  "description": "Bulk AI photo edits from the terminal: remove backgrounds, upscale, recolor, change scenes, poses and models for whole folders of product photos.",
+  "keywords": [
+    "bulk-background-remover",
+    "batch-image-upscaler",
+    "remove-background",
+    "product-photography",
+    "ai-photoshoot",
+    "ghost-mannequin",
+    "ecommerce",
+    "cli",
+    "garmo"
+  ],
+  "homepage": "https://garmo.studio/api/cli/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/garmostudio/garmo-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/garmostudio/garmo-cli/issues",
+    "email": "support@garmo.studio"
+  },
+  "license": "MIT",
+  "author": "Garmo <support@garmo.studio>",
+  "type": "module",
+  "bin": {
+    "garmo": "bin/garmo.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.3"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "publishConfig": {
+    "access": "public"
+  }
+}

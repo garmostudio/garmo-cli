@@ -1,0 +1,216 @@
+// Batch runs against a fake API that misbehaves: whatever happens, one photo + settings = one job.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import http from 'node:http';
+import { Writable } from 'node:stream';
+import { Client } from '../src/api.js';
+import { prepare, runBatch, STATE_FILE } from '../src/batch.js';
+import { expandInputs } from '../src/files.js';
+import { Reporter } from '../src/output.js';
+import { TOOL } from '../src/commands.js';
+
+const PNG = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+const KEY = 'gm_test_' + 'k'.repeat(43);
+
+/** A fake API. behave(name, attempt) may return 'rate' | 'busy' | 'boom' | 'lost' | 'slow' | 'bad' | 'broke' | null. */
+function fakeApi({ behave = () => null, credits = Infinity } = {}) {
+  const jobs = new Map();         // id → { polls, idem }
+  const byIdem = new Map();       // idem → id
+  const attempts = new Map();     // idem → n
+  const downloads = new Map();
+  let created = 0;
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      const url = new URL(req.url, 'http://x');
+      const send = (status, body, headers = {}) => { res.writeHead(status, { 'content-type': 'application/json', ...headers }); res.end(JSON.stringify(body)); };
+      const err = (status, code, headers) => send(status, { error: { code, message: code, request_id: 'req_test' } }, headers);
+      if (url.pathname.startsWith('/files/')) {
+        const id = url.pathname.slice(7);
+        const n = (downloads.get(id) ?? 0) + 1;
+        downloads.set(id, n);
+        if (id.startsWith('jobcut') && n === 1) {   // the first download of the "cut" photo breaks off
+          res.writeHead(200, { 'content-type': 'image/png', 'content-length': String(PNG.length * 10) });
+          res.write(PNG);
+          setTimeout(() => res.destroy(), 5);
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'image/png', 'content-length': String(PNG.length) });
+        res.end(PNG);
+        return;
+      }
+      if (req.headers.authorization !== `Bearer ${KEY}`) return err(401, 'invalid_api_key');
+      if (req.method === 'GET' && url.pathname.startsWith('/jobs/')) {
+        const id = url.pathname.slice(6);
+        const job = jobs.get(id);
+        if (!job) return err(404, 'not_found');
+        job.polls++;
+        return send(200, payload(id, job.polls > 1 ? 'completed' : 'processing'));
+      }
+      if (req.method === 'POST' && url.pathname === '/edit/remove-background') {
+        const idem = req.headers['idempotency-key'];
+        assert.ok(idem, 'every create has an Idempotency-Key');
+        assert.ok(String(req.headers['garmo-client']).startsWith('cli/'));
+        const n = (attempts.get(idem) ?? 0) + 1;
+        attempts.set(idem, n);
+        if (byIdem.has(idem)) return send(200, payload(byIdem.get(idem), 'processing'));
+        const name = /filename="([^"]+)"/.exec(Buffer.concat(chunks).toString('latin1'))?.[1];
+        const body = Buffer.concat(chunks).toString('latin1');
+        const tag = /tag:(\w+)/.exec(body)?.[1] ?? '';
+        const how = behave(tag, n, name);
+        if (how === 'rate') return err(429, 'rate_limited', { 'retry-after': '1' });
+        if (how === 'busy') return err(503, 'unavailable', { 'retry-after': '1' });
+        if (how === 'boom') return err(500, 'internal_error');
+        if (how === 'slow') return err(409, 'idempotency_in_progress', { 'retry-after': '1' });
+        if (how === 'bad') return err(400, 'invalid_image');
+        if (created >= credits) return err(402, 'insufficient_credits');
+        const id = `job${tag || 'x'}${++created}`;
+        jobs.set(id, { polls: 0, idem });
+        byIdem.set(idem, id);
+        if (how === 'lost') { res.destroy(); return; }   // the job exists, but the answer never arrives
+        return send(202, payload(id, 'processing'));
+      }
+      err(404, 'not_found');
+    });
+  });
+  const payload = (id, status) => ({
+    id, object: 'job', tool: 'remove-background', status, livemode: false, credits_charged: 0, credits_refunded: 0,
+    outputs: [{ id: 'out_1', status: status === 'completed' ? 'succeeded' : 'processing', label: 'White', ...(status === 'completed' ? { url: `${base()}/files/${id}-1` } : {}) }],
+  });
+  const base = () => `http://127.0.0.1:${server.address().port}`;
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({
+    base: base(), server, jobs, attempts, byIdem, get created() { return created; }, set credits(v) { credits = v; },
+    close: () => new Promise((r) => { server.closeAllConnections(); server.close(r); }),
+  })));
+}
+
+/** Photos whose bytes carry a tag the fake server reads (so each is a different file). */
+function photos(tags) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'garmo-batch-'));
+  for (const t of tags) fs.writeFileSync(path.join(dir, `${t}.png`), Buffer.concat([PNG, Buffer.from(`tag:${t} `)]));
+  return dir;
+}
+
+const quiet = () => new Reporter({ json: true, stdout: new Writable({ write(_c, _e, cb) { cb(); } }), stderr: new Writable({ write(_c, _e, cb) { cb(); } }) });
+
+async function run(api, dir, out, extra = {}) {
+  const client = new Client({ key: KEY, base: api.base, waitScale: 0.002 });
+  const tool = TOOL['remove-bg'];
+  const opts = { bg: 'white' };
+  const { items } = expandInputs([dir], { outDir: out });
+  const { tasks } = await prepare(tool, opts, items, {}, { test: true });
+  return runBatch({ client, tool, tasks, outDir: out, reporter: quiet(), cap: 3, ...extra });
+}
+
+test('rate limits, 503, 500, lost answers and in-progress retries never make a second job', async () => {
+  const tags = ['ok1', 'rate', 'busy', 'boom', 'lost', 'slow', 'cut', 'bad', 'ok2'];
+  const api = await fakeApi({
+    behave: (tag, n) => (tag === 'bad' ? 'bad' : n === 1 && ['rate', 'busy', 'boom', 'lost', 'slow'].includes(tag) ? tag : null),
+  });
+  try {
+    const dir = photos(tags);
+    const out = path.join(dir, 'out');
+    const s = await run(api, dir, out);
+    assert.equal(api.created, 8, 'one job per good photo');
+    assert.equal(new Set(api.byIdem.values()).size, 8);
+    assert.equal(s.done.length, 8);
+    assert.deepEqual(s.failed.map((f) => f.file), ['bad.png']);
+    for (const t of tags.filter((x) => x !== 'bad')) assert.ok(fs.existsSync(path.join(out, `${t}-remove-bg-white.png`)), t);
+    assert.equal(fs.readdirSync(out).filter((f) => f.endsWith('.part')).length, 0, 'no half files');
+
+    // The same command again: everything done is skipped without a request.
+    const before = [...api.attempts.values()].reduce((a, b) => a + b, 0);
+    const again = await run(api, dir, out);
+    assert.equal(again.skipped.length, 8);
+    assert.equal(api.created, 8);
+    const after = [...api.attempts.values()].reduce((a, b) => a + b, 0);
+    assert.equal(after - before, 1, 'only the failed photo is tried again');
+
+    // State file lost: the server's Idempotency-Key still returns the same jobs.
+    fs.unlinkSync(path.join(out, STATE_FILE));
+    const lost = await run(api, dir, out);
+    assert.equal(api.created, 8, 'no new jobs without the state file');
+    assert.equal(lost.done.length, 8);
+  } finally {
+    await api.close();
+  }
+});
+
+test('out of credits stops new jobs, finishes the rest, and resumes without paying twice', async () => {
+  const tags = Array.from({ length: 10 }, (_, i) => `p${i}`);
+  const api = await fakeApi({ credits: 4 });
+  try {
+    const dir = photos(tags);
+    const out = path.join(dir, 'out');
+    const s = await run(api, dir, out);
+    assert.equal(s.halt, 'credits');
+    assert.equal(s.done.length, 4);
+    assert.equal(s.notStarted.length, 6);
+    api.credits = Infinity;
+    const s2 = await run(api, dir, out);
+    assert.equal(s2.skipped.length, 4);
+    assert.equal(s2.done.length, 6);
+    assert.equal(api.created, 10);
+  } finally {
+    await api.close();
+  }
+});
+
+test('Ctrl+C: no new jobs; the next run picks up started ones instead of starting them again', async () => {
+  const tags = Array.from({ length: 8 }, (_, i) => `c${i}`);
+  const api = await fakeApi();
+  try {
+    const dir = photos(tags);
+    const out = path.join(dir, 'out');
+    const stop = { requested: false };
+    const timer = setInterval(() => { if (api.created >= 3) stop.requested = true; }, 1);
+    const s = await run(api, dir, out, { stop });
+    clearInterval(timer);
+    assert.ok(s.notStarted.length > 0, 'some photos were not started');
+    const firstJobs = api.created;
+    const s2 = await run(api, dir, out);
+    assert.equal(api.created, 8);
+    assert.equal(s2.done.length + s2.skipped.length, 8);
+    assert.ok(firstJobs < 8);
+    for (const t of tags) assert.ok(fs.existsSync(path.join(out, `${t}-remove-bg-white.png`)), t);
+  } finally {
+    await api.close();
+  }
+});
+
+test('--no-wait starts every job and returns before they finish', async () => {
+  const api = await fakeApi();
+  try {
+    const dir = photos(['n1', 'n2']);
+    const out = path.join(dir, 'out');
+    const s = await run(api, dir, out, { noWait: true });
+    assert.equal(s.started.length, 2);
+    assert.equal(api.created, 2);
+    const s2 = await run(api, dir, out);
+    assert.equal(api.created, 2);
+    assert.equal(s2.done.length, 2);
+  } finally {
+    await api.close();
+  }
+});
+
+test('a wrong key stops the run at once', async () => {
+  const api = await fakeApi();
+  try {
+    const dir = photos(['a', 'b', 'c', 'd', 'e']);
+    const out = path.join(dir, 'out');
+    const client = new Client({ key: 'gm_test_' + 'z'.repeat(43), base: api.base, waitScale: 0.002 });
+    const { items } = expandInputs([dir], { outDir: out });
+    const { tasks } = await prepare(TOOL['remove-bg'], {}, items, {}, { test: true });
+    const s = await runBatch({ client, tool: TOOL['remove-bg'], tasks, outDir: out, reporter: quiet(), cap: 1 });
+    assert.equal(s.halt, 'auth');
+    assert.equal(api.created, 0);
+    assert.equal(s.notStarted.length, 5);
+  } finally {
+    await api.close();
+  }
+});

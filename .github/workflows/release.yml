@@ -1,0 +1,24 @@
+# Publish to npm when a version tag (v0.9.1, v1.0.0-beta.1 …) is pushed, with provenance and no stored token:
+# npm "trusted publishing" (npmjs.com › @garmo/cli › Settings › Trusted publisher: this repo, release.yml).
+# Pre-release versions (with a "-") go out under the "beta" tag; "latest" is moved by hand after testing.
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: npm install -g npm@latest
+      - run: node --test
+      - name: tag matches package.json
+        run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
+      - run: npm publish --provenance --access public --tag ${{ contains(github.ref_name, '-') && 'beta' || 'latest' }}

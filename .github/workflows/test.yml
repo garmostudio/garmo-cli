@@ -1,0 +1,35 @@
+# Every push and pull request: the tests and an offline dry run on Linux, Windows and macOS, Node 20 and 22.
+name: test
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [20, 22]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: node --test
+      - run: node bin/garmo.js --version
+      - run: node bin/garmo.js --help
+      # a quoted pattern, expanded by garmo itself (PowerShell does not expand it), with no key and no network
+      - name: dry run
+        shell: bash
+        run: |
+          mkdir -p shots/sub
+          node -e "for (const f of ['shots/a.png','shots/b.jpg','shots/sub/c.webp']) require('fs').writeFileSync(f, Buffer.from(f.endsWith('png') ? '89504e470d0a1a0a' : f.endsWith('jpg') ? 'ffd8ffe0' : '524946460000000057454250', 'hex'))"
+          node bin/garmo.js remove-bg "shots/**/*" --dry-run | tee out.txt
+          grep -q "3 photos" out.txt
+      - name: dry run (PowerShell)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: node bin/garmo.js remove-bg "shots/*.png" --dry-run
